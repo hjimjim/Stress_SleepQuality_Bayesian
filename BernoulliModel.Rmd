@@ -1,0 +1,215 @@
+---
+title: "STATS205P_Project"
+output: html_document
+date: "2024-05-24"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Question1
+
+```{r}
+library(brms)
+library(rstan)
+library(dplyr)
+
+data <- read.csv("Sleep_health_and_lifestyle_dataset.csv", header = TRUE)
+columns_to_drop <- c("Person.ID", "Sleep.Duration", "Quality.of.Sleep", 
+                      "High.Blood.Pressure", "Low.Blood.Pressure", "Daily.Steps", 
+                     "BMI.Category", "Heart.Rate")
+clean_data <- data[, -which(names(data) %in% columns_to_drop)]
+clean_data <- clean_data %>%
+  filter(Occupation != "Manager", Occupation != "Sales Representative")
+
+clean_data$Gender <- as.integer(clean_data$Gender == "Male")
+clean_data$Occupation <- as.factor(clean_data$Occupation)
+
+sleep_data <- clean_data
+sleep_data$Sleep.Category <- ifelse(sleep_data$Sleep.Disorder == "None", 0, 1)
+colnames(sleep_data)
+```
+
+
+```{r}
+stan_code <- "
+data {
+  int<lower=1> D; // # of features 6 
+  int<lower=0> N; // # of observations 374
+  int<lower=1> L; // # occupations 10
+  array[N] int<lower=0> y; 
+  array[N] int<lower=1, upper=L> ll;
+  array[N] row_vector[D] x;
+}
+parameters {
+  array[D] real<lower=0> sigma;
+  real<lower=0> sigma_intercept; // Overall standard deviation
+  real<lower=0> sigma_overall; // Overall standard deviation
+  real<lower=0> sigma_demographic; // Standard deviation for demographic variables
+  real<lower=0> sigma_health; // Standard deviation for health variables
+  array[L] vector[D] beta;
+}
+
+model {
+  sigma_overall ~ scaled_inv_chi_square(1, 0.05); // Prior for sigma_overall
+  sigma_demographic ~ scaled_inv_chi_square(1, sigma_overall); // Prior for sigma_overall
+  sigma_health ~ scaled_inv_chi_square(1, sigma_overall); // Prior for sigma_overall
+  sigma_intercept ~ scaled_inv_chi_square(1, sigma_overall);
+  
+  sigma[1] ~ scaled_inv_chi_square(1, sigma_intercept);
+  sigma[2:3] ~  scaled_inv_chi_square(1, sigma_demographic);
+  sigma[4:5] ~  scaled_inv_chi_square(1, sigma_health);
+  for (d in 1:D) {
+    for (l in 1:L) {
+      beta[l, d] ~ normal(0, sigma[d]);
+    }
+  }
+  
+  for (n in 1:N) {
+    y[n] ~ bernoulli_logit(x[n] * beta[ll[n]]);
+  }
+}
+
+generated quantities {
+  // Define a new variable 'predicted_y' based on model parameters and data
+  vector[N] predicted_y;
+  
+  for (n in 1:N) {
+    predicted_y[n] = bernoulli_logit_rng(x[n] * beta[ll[n]]);
+  }
+}
+"
+stan_model <- stan_model(model_code = stan_code)
+```
+
+
+```{r}
+###############################################################################
+# Check the influence of the stress level on having sleep disorder #
+###############################################################################
+
+# Extract relevant columns for x and ll
+x <- as.matrix(sleep_data[, c("Gender", "Age", "Physical.Activity.Level", "Stress.Level")])
+x_0 <- rep(1, nrow(x)) # Create a column of ones
+x_with_intercept <- cbind(x_0, x) # Combine the intercept term with the original matrix
+dim(x_with_intercept)
+
+D <- dim(x_with_intercept)[2]  # Number of features + intercept
+N <- nrow(sleep_data) # Number of data points
+L <- length(unique(sleep_data$Occupation))  # Number of levels for 'category'
+ll <- as.integer((sleep_data$Occupation))
+y = sleep_data$Sleep.Category
+# Prepare data list
+data_list <- list(
+  D = D,
+  N = N,
+  L = L,
+  y = y,
+  ll = ll,  # Use matrix instead of array
+  x = x_with_intercept
+)
+
+fit1 <- sampling(stan_model, data = data_list)
+```
+
+
+```{r}
+samples <- extract(fit1)
+fit_summary <- summary(fit1)
+summary_table <- fit_summary$summary
+
+# Filter the rows for beta parameters using regular expressions
+beta_rows <- grepl("beta", rownames(summary_table))
+
+# Extract only the beta parameters
+coef_summary <- summary_table[beta_rows, ]
+
+# Print the extracted beta summary
+print(coef_summary)
+
+
+beta_samples <- extract(fit1)$beta
+
+# Calculate summary statistics for the coefficients
+coef_summary <- apply(beta_samples, c(2, 3), mean)  # Take mean across MCMC samples
+print(coef_summary)
+
+# 2. Interpret Odds Ratios
+odds_ratios <- exp(coef_summary)
+print(odds_ratios)
+
+
+# 3. Compare Occupations
+occupation_coef <- coef_summary[, 5]
+print(coef_summary)
+
+occupation_names <- levels(as.factor(sleep_data$Occupation))
+occupation_names
+# 4. Visualize Coefficients
+# Create a bar plot of coefficients for Stress.Level across different occupations
+barplot(occupation_coef, names.arg = occupation_names, las = 2,
+        xlab = "Occupation", ylab = "Coefficient for Stress.Level")
+
+
+# 5. Posterior Predictive Checks
+# Compare predicted probabilities of sleep disorder with observed outcomes
+observed_outcomes <- sleep_data$Sleep.Category
+predicted_probabilities <- apply(samples$predicted_y, 2, mean)
+plot(predicted_probabilities, observed_outcomes, 
+     xlab = "Predicted Probability of Sleep Disorder", 
+     ylab = "Observed Sleep Disorder (0 = No, 1 = Yes)", 
+     main = "Posterior Predictive Check")
+```
+
+
+```{r}
+samples <- extract(fit1)
+predicted_y <- samples$predicted_y
+accuracy <- mean(predicted_y == y)
+accuracy
+# 6. Predictive Accuracy
+# Calculate predictive accuracy metrics
+accuracy <- mean(predicted_y == sleep_data$Sleep.Category)
+print(paste("Accuracy:", accuracy))
+
+samples <- extract(fit1)
+# Extract posterior samples of predicted_y
+predicted_y <- samples$predicted_y
+
+# Initialize confusion matrix
+conf_matrix <- matrix(0, nrow = 2, ncol = 2)
+
+# Sum confusion matrices over all iterations
+for (i in 1:nrow(predicted_y)) {
+  conf_matrix <- conf_matrix + table(factor(predicted_y[i, ], levels = c(0, 1)),
+                                     factor(sleep_data$Sleep.Category, levels = c(0, 1)))
+}
+
+# Calculate precision, recall, and F1 score
+precision <- conf_matrix[2, 2] / sum(conf_matrix[, 2])
+recall <- conf_matrix[2, 2] / sum(conf_matrix[2, ])
+f1_score <- 2 * precision * recall / (precision + recall)
+
+# Print results
+print(paste("Precision:", precision))
+print(paste("Recall:", recall))
+print(paste("F1 Score:", f1_score))
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
